@@ -7,16 +7,26 @@ const API_PARAMS = new URLSearchParams({
   sports: 236, champs: 2050671, lng: 'en', gr: 285,
   country: 96, virtualSports: 'true', groupChamps: 'true',
 });
+
+// Headers complets imitant un vrai navigateur Chrome
 const API_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-  'Accept': 'application/json',
-  'Referer': 'https://1xbet.com/',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept': 'application/json, text/plain, */*',
+  'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Origin': 'https://1xbet.com',
+  'Referer': 'https://1xbet.com/fr/live/baccarat',
+  'Sec-Fetch-Dest': 'empty',
+  'Sec-Fetch-Mode': 'cors',
+  'Sec-Fetch-Site': 'same-origin',
+  'Connection': 'keep-alive',
 };
 
 const SUIT_MAP = { 0: '♠️', 1: '♣️', 2: '♦️', 3: '♥️' };
-let gamesCache = [];
-let lastFetch = 0;
-const CACHE_TTL = 4000;
+let gamesCache   = [];
+let lastFetch    = 0;          // timestamp du dernier fetch réussi (serveur OU client)
+let lastClientPush = 0;        // timestamp du dernier push client
+const CACHE_TTL  = 4000;
 
 function parseCards(scSList) {
   let player = [], banker = [];
@@ -103,6 +113,60 @@ async function fetchGames() {
     return gamesCache;
   }
 }
+
+// ── Relay client → serveur (quand le serveur ne peut pas atteindre 1xBet) ──
+function parseRawData(data) {
+  if (!data?.Value || !Array.isArray(data.Value)) return null;
+  let baccaratSport = null;
+  for (const sport of data.Value) {
+    if ((sport.N === 'Baccarat' || sport.I === 236) && sport.L) { baccaratSport = sport; break; }
+  }
+  if (!baccaratSport) return null;
+  const results = [];
+  for (const champ of baccaratSport.L || []) {
+    for (const game of champ.G || []) {
+      if (!game.DI) continue;
+      const sc  = game.SC || {};
+      const scS = sc.S  || [];
+      const { player, banker } = parseCards(scS);
+      results.push({
+        game_number:  parseInt(game.DI),
+        player_cards: player, banker_cards: banker,
+        winner:       parseWinner(scS),
+        is_finished:  isGameFinished(game, scS),
+        phase:        parsePhase(scS),
+        score:        sc.FS || {},
+        championship: champ.L || champ.N || '',
+        status_label: sc.SLS || '',
+      });
+    }
+  }
+  results.sort((a, b) => b.game_number - a.game_number);
+  return results;
+}
+
+// POST /api/games/client-push  — le navigateur envoie les données brutes de 1xBet
+router.post('/client-push', async (req, res) => {
+  if (!req.session?.userId) return res.status(401).json({ error: 'Non connecté' });
+  try {
+    const parsed = parseRawData(req.body);
+    if (!parsed) return res.status(400).json({ error: 'Données invalides' });
+    gamesCache    = parsed;
+    lastFetch     = Date.now();
+    lastClientPush = Date.now();
+    res.json({ ok: true, count: parsed.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/games/source — informe le client si le serveur peut fetch lui-même
+router.get('/source', (req, res) => {
+  const serverOk = (Date.now() - lastFetch < 15000) && lastClientPush === 0;
+  res.json({
+    server_fetching: serverOk,
+    last_fetch_ago:  Math.round((Date.now() - lastFetch) / 1000),
+    cache_size:      gamesCache.length,
+  });
+});
 
 router.get('/absences', (req, res) => {
   if (!req.session.userId || !req.session.isAdmin) return res.status(403).json({ error: 'Admin requis' });
